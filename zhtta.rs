@@ -41,6 +41,7 @@ static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, 
              </style></head>
              <body>";
 
+mod gash;
 
 struct HTTP_Request {
     // Use peer_name as the key to access TcpStream in hashmap. 
@@ -200,14 +201,144 @@ impl WebServer {
         stream.write(file_reader.read_to_end());
     }
     
-    // TODO: Server-side gashing.
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
-        // for now, just serve as static file
-        WebServer::respond_with_static_file(stream, path);
+        let mut stream = stream;
+        let mut file_reader = File::open(path).expect("Invalid file!");
+        stream.write(HTTP_OK.as_bytes());
+
+        let begin_comment : ~[u8] = "<!--#exec cmd=\"".bytes().collect();
+        let end_comment : ~[u8] = "\" -->".bytes().collect();
+
+        // Stores bytes when a possible comment is encountered. Writes them
+        // to the stream iff they are not a server-side exec command.
+        let mut buffer: ~[u8] = ~[]; 
+        // Stores the command to run in gash, if we think we found one.
+        let mut cmd: ~[u8] = ~[];
+        // The position of the buffer, relative to the current `begin_comment`
+        // or `end_comment` byte arrays that we are parsing.
+        let mut buffer_pos: uint = 0;
+        // Whether we are parsing the beginning of a comment or not.
+        let mut l_comment = false;
+        // Whether we are parsing the end of a comment or not.
+        let mut r_comment = false;
+
+        // Do this byte-by-byte. Should be fast, but by golly is it ugly.
+        for byte in file_reader.bytes() {
+            // We haven't found anything that looks like a comment.
+            if l_comment==false {
+                if byte != begin_comment[0] {
+                    // This is not the beginning of a comment. Write byte to
+                    // the stream.
+                    stream.write(&[byte]);
+                }
+                else {
+                    // This is a comment. Add the byte to the possible comment
+                    // buffer, and try to parse it as a comment.
+                    l_comment = true;
+                    // Add the byte to the buffer.
+                    buffer = ~[byte];
+                    // Buffer pos is 1 because we already added the first byte.
+                    buffer_pos = 1;
+                }
+            }
+            else {
+                // We are parsing either a command, or the beginning of (what
+                // we think is) an exec comment.
+                if !r_comment {
+                    // Whether we are at the end of a "begin comment" keyword
+                    // or not.
+                    let end_of_l = buffer_pos >= begin_comment.len();
+
+                    // If we're not at the end of an opening comment, and this
+                    // byte looks like the next character in an opening comment,
+                    // then push the byte to the buffer.
+                    if !end_of_l && byte == begin_comment[buffer_pos] {
+                        buffer.push(byte);
+                        buffer_pos += 1;
+                    }
+                    // Otherwise, if we made it all the way to the end of a
+                    // "begin comment" without failing, then this is a command.
+                    else if end_of_l && byte != end_comment[0] {
+                        // Also buffer the byte, in case this turns out to not
+                        // be a properly formatted comment and we want to send
+                        // it to the client.
+                        buffer.push(byte);
+                        cmd.push(byte);
+                    }
+                    // This byte is the identifier for the end of a comment.
+                    else if byte == end_comment[0] {
+                        // Buffer the byte anyway, in case this turns out to
+                        // not actually be an exec command.
+                        buffer.push(byte);
+                        r_comment = true;
+                        // Buffer_pos is 1 because we already know this is an
+                        // end comment and we already buffered the first byte
+                        // for an end comment.
+                        buffer_pos = 1;
+                    }
+                    // We didn't make it to the end of `begin_comment` without
+                    // failing. Write the buffer to the stream, flush the
+                    // buffers, and reset the comment flag.
+                    else {
+                        // Push the byte to the buffer, so we send it along
+                        // with the rest of the bytes.
+                        buffer.push(byte);
+                        stream.write(buffer);
+
+                        l_comment = false;
+                        buffer_pos = 0;
+                        cmd = ~[];
+                        buffer = ~[];
+                    }
+                }
+                // We successfully parsed a `begin_comment`, a command, and
+                // the first character of an `end_comment`.
+                else {
+                    let end_of_r = buffer_pos >= end_comment.len();
+                    // We're not at the end of `end_comment`, and this byte
+                    // still looks like an `end_comment`.
+                    if !end_of_r && byte == end_comment[buffer_pos] {
+                        buffer.push(byte);
+                        buffer_pos += 1;
+                    }
+                    // We made it to the end of `end_comment` successfully,
+                    // and we got a command. Run it in gash, then write it
+                    // to the stream and flush the buffers.
+                    else if end_of_r {
+                        let result = gash::run_cmdline(std::str::from_utf8(cmd));
+                        stream.write(result.as_bytes());
+                        stream.write(&[byte]);
+
+                        r_comment = false;
+                        l_comment = false;
+                        buffer_pos = 0;
+                        buffer = ~[];
+                        cmd = ~[];
+                    }
+                    // We didn't make it to the end of `end_comment` without
+                    // failing, so this is not a server-side gash command.
+                    // Write the buffer to the stream, then flush the buffers.
+                    else {
+                        // Push the current byte first, so it isn't lost.
+                        buffer.push(byte);
+                        stream.write(buffer);
+
+                        r_comment = false;
+                        l_comment = false;
+                        buffer_pos = 0;
+                        buffer = ~[];
+                        cmd = ~[];
+                    }
+                }
+            }
+        }
     }
     
     // TODO: Smarter Scheduling.
-    fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>, req_queue_arc: MutexArc<~[HTTP_Request]>, notify_chan: SharedChan<()>) {
+    fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>,
+                                   path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>,
+                                   req_queue_arc: MutexArc<~[HTTP_Request]>,
+                                   notify_chan: SharedChan<()>) {
         // Save stream in hashmap for later response.
         let mut stream = stream;
         let peer_name = WebServer::get_peer_name(&mut stream);
