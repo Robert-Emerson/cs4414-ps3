@@ -62,7 +62,9 @@ function help () {
     echo >&2 "                      created"
     echo >&2 "  --testfile FILE     Specify a file FILE to use as httperf testfile input"
 }
-while [[ $# -gt 0 ]] && [[ ."$1" = .--* ]] ;
+
+
+while [[ $# > 1 ]]
 do
     opt="$1";
     shift; #expose next argument
