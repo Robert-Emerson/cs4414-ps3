@@ -16,21 +16,20 @@ LOGFILE_SEP="------------------------------\n"
 function benchmark () {
     # Add the current commit id, git user name, and date/time to the logfile.
     printf "%b" $LOGFILE_SEP >> $LOGFILE
-    echo $(git config --get user.name) $(git rev-parse HEAD) | tee -a $LOGFILE
-    echo $(date) | tee -a $LOGFILE
+    echo $(git config --get user.name) $(date) | tee -a $LOGFILE
+    echo $(git rev-parse HEAD) $(git symbolic-ref -q HEAD) | \
+        tee -a $LOGFILE
     printf "%b" $LOGFILE_SEP >> $LOGFILE
 
     # Benchmark the server
     (case $USE_TEST_FILE in
         "1" )
-            echo "Using test file for benchmark."
             /usr/bin/time -a -o $LOGFILE \
             httperf --client=0/1 --server=$SERVER --port=$PORT --rate=$RATE \
                 --send-buffer=$SENDBUFFER --recv-buffer=$RECVBUFFER \
                 --num-conns=$CONNECTIONS \ --num-calls=1 --wlog=y,"$TEST_FILE"
             ;;
         * )
-            echo "Using web root for benchmark."
             /usr/bin/time -a -o $LOGFILE \
             httperf --client=0/1 --server=$SERVER --port=$PORT --uri=$URI \
                 --rate=$RATE --send-buffer=$SENDBUFFER --recv-buffer=$RECVBUFFER \
