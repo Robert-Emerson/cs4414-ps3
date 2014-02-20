@@ -23,12 +23,14 @@ function benchmark () {
     (case $USE_TEST_FILE in
         "1" )
             echo "Using test file for benchmark."
+            /usr/bin/time -a -o $LOGFILE \
             httperf --client=0/1 --server=$SERVER --port=$PORT --rate=$RATE \
                 --send-buffer=$SENDBUFFER --recv-buffer=$RECVBUFFER \
                 --num-conns=$CONNECTIONS \ --num-calls=1 --wlog=y,"$TEST_FILE"
             ;;
         * )
             echo "Using web root for benchmark."
+            /usr/bin/time -a -o $LOGFILE \
             httperf --client=0/1 --server=$SERVER --port=$PORT --uri=/ \
                 --rate=$RATE --send-buffer=$SENDBUFFER --recv-buffer=$RECVBUFFER \
                 --num-conns=$CONNECTIONS \ --num-calls=1
