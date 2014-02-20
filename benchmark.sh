@@ -9,6 +9,7 @@ RECVBUFFER=16384
 SERVER="127.0.0.1"
 PORT=4414
 TEST_FILE="./zhtta-test.txt"
+URI="/"
 USE_TEST_FILE=0
 LOGFILE_SEP="------------------------------\n"
 
@@ -31,7 +32,7 @@ function benchmark () {
         * )
             echo "Using web root for benchmark."
             /usr/bin/time -a -o $LOGFILE \
-            httperf --client=0/1 --server=$SERVER --port=$PORT --uri=/ \
+            httperf --client=0/1 --server=$SERVER --port=$PORT --uri=$URI \
                 --rate=$RATE --send-buffer=$SENDBUFFER --recv-buffer=$RECVBUFFER \
                 --num-conns=$CONNECTIONS \ --num-calls=1
             ;;
@@ -63,6 +64,7 @@ function help () {
     echo >&2 "  --rate RATE         Specify the fixed rate RATE at which connections are"
     echo >&2 "                      created"
     echo >&2 "  --testfile FILE     Specify a file FILE to use as httperf testfile input"
+    echo >&2 "  --uri URI           Specify a parituclar uri URI to benchmakr"
 }
 
 
@@ -87,8 +89,21 @@ do
             RATE="$1"
             ;;
         "--testfile")
-            TEST_FILE="$1"
-            USE_TEST_FILE=1
+            if [ -n "$URI" ]; then
+                TEST_FILE="$1"
+                USE_TEST_FILE=1
+            else
+                ERR=1
+                echo >&2 "--uri and --testfile are mutually exclusive"
+            fi
+            ;;
+        "--uri")
+            if [ -n "$USE_TEST_FILE" ]; then
+                URI="$1"
+            else
+                ERR=1
+                echo >&2 "--uri and --testfile are mutually exclusive"
+            fi
             ;;
         "--help" )
             help
@@ -98,6 +113,9 @@ do
     esac
 done
 
-if [ -z "$HELP" ]; then
+if [ -z "$HELP" -a -z "$ERR" ]; then
+    if [ -z "$URI" -a -z "$USE_TEST_FILE" ]; then
+        URI="/"
+    fi
     start_benchmark
 fi
