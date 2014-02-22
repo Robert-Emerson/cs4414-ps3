@@ -2,14 +2,14 @@
 # Script for benchmarking the zhtta server
 
 LOGFILE="zhtta-perf.log"
-RATE=50
-CONNECTIONS=100
+RATE=10000
+CONNECTIONS=10000
 SENDBUFFER=4096
 RECVBUFFER=16384
 SERVER="127.0.0.1"
 PORT=4414
 TEST_FILE="./zhtta-test.txt"
-URI="/"
+URI=""
 USE_TEST_FILE=0
 LOGFILE_SEP="------------------------------\n"
 
@@ -27,13 +27,13 @@ function benchmark () {
             /usr/bin/time -a -o $LOGFILE \
             httperf --client=0/1 --server=$SERVER --port=$PORT --rate=$RATE \
                 --send-buffer=$SENDBUFFER --recv-buffer=$RECVBUFFER \
-                --num-conns=$CONNECTIONS \ --num-calls=1 --wlog=y,"$TEST_FILE"
+                --num-conns=$CONNECTIONS --num-calls=1 --wlog=y,"$TEST_FILE"
             ;;
         * )
             /usr/bin/time -a -o $LOGFILE \
             httperf --client=0/1 --server=$SERVER --port=$PORT --uri=$URI \
                 --rate=$RATE --send-buffer=$SENDBUFFER --recv-buffer=$RECVBUFFER \
-                --num-conns=$CONNECTIONS \ --num-calls=1
+                --num-conns=$CONNECTIONS --num-calls=1
             ;;
     esac) | tee -a $LOGFILE;
     echo "Wrote performance benchmark to '$LOGFILE'."
@@ -66,16 +66,11 @@ function help () {
     echo >&2 "  --uri URI           Specify a parituclar uri URI to benchmakr"
 }
 
-
-while [[ $# > 1 ]]
-do
+while [[ $# > 0 ]]; do
     opt="$1";
-    shift; #expose next argument
+    shift;
     case "$opt" in
-        "--" ) 
-            break 2
-            ;;
-        "--port")
+        "--port" )
             PORT="$1"
             ;;
         "--server" )
@@ -87,8 +82,8 @@ do
         "--rate" )
             RATE="$1"
             ;;
-        "--testfile")
-            if [ -n "$URI" ]; then
+        "--testfile" )
+            if [ -z "$URI" ]; then
                 TEST_FILE="$1"
                 USE_TEST_FILE=1
             else
@@ -96,8 +91,8 @@ do
                 echo >&2 "--uri and --testfile are mutually exclusive"
             fi
             ;;
-        "--uri")
-            if [ -n "$USE_TEST_FILE" ]; then
+        "--uri" )
+            if [ "$USE_TEST_FILE" != 1 ]; then
                 URI="$1"
             else
                 ERR=1
@@ -113,7 +108,7 @@ do
 done
 
 if [ -z "$HELP" -a -z "$ERR" ]; then
-    if [ -z "$URI" -a -z "$USE_TEST_FILE" ]; then
+    if [ -z "$URI" ]; then
         URI="/"
     fi
     start_benchmark
