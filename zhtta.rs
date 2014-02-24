@@ -59,6 +59,8 @@ struct WebServer {
     
     request_queue_arc: MutexArc<~[HTTP_Request]>,
     stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>,
+
+    static_cache: MutexArc<HashMap<~Path, ~[u8]>>,
     
     notify_port: Port<()>,
     shared_notify_chan: SharedChan<()>,
@@ -79,6 +81,8 @@ impl WebServer {
                         
             request_queue_arc: MutexArc::new(~[]),
             stream_map_arc: MutexArc::new(HashMap::new()),
+
+            static_cache: MutexArc::new(HashMap::new()),
             
             notify_port: notify_port,
             shared_notify_chan: shared_notify_chan,
@@ -192,13 +196,80 @@ impl WebServer {
 	})
     }
     
-    // TODO: Streaming file.
-    // TODO: Application-layer file caching.
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
+    fn respond_with_static_file(&mut self, 
+                                stream: Option<std::io::net::tcp::TcpStream>,
+                                path: &Path) {
+        // Incrementally write the file to the TCP stream. Break gracefully at
+        // EOF. Return the contents of the file.
+        fn incr_write(stream: &mut Option<std::io::net::tcp::TcpStream>,
+                    path: &Path) -> ~[u8] {
+            let read_count = 4096; // Number of bytes to read at a time
+            let mut buffer: ~[u8] = ~[]; // Stores bytes while sending them
+            let mut reader = File::open(path).expect("Invalid file!");
+            let mut error = None;
+            while error.is_none() {
+                // Error becomes Some(_) when we reach EOF.
+                let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
+                        .inside(|| reader.read_bytes(read_count));
+                stream.write(bytes);
+                buffer = buffer + bytes;
+            }
+            debug!("Cached {:u} bytes", buffer.len());
+            buffer // Return all read bytes
+        }
         let mut stream = stream;
-        let mut file_reader = File::open(path).expect("Invalid file!");
+
         stream.write(HTTP_OK.as_bytes());
-        stream.write(file_reader.read_to_end());
+
+        debug!("Checking for file in cache from mutex lock.");
+        let cached = self.static_cache.access(|cache| 
+                          cache.contains_key(&~path.clone()));
+        debug!("File cached: {:?}", cached);
+
+        if cached { // File is cached.
+            let mut eof = false; // True when we're at the end of the cache.
+
+            let mut pos = 0; // Position in cache.
+            let mut len = 0; // Length of cache.
+
+            // Number of bytes to read from cache before re-acquiring the lock.
+            let read_count = 4096;
+
+            while !eof {
+                self.static_cache.access(|cache: &mut HashMap<~Path,~[u8]>| {
+                    // Access the bytes in the cache.
+                    let bytes = cache.get(&~path.clone());
+
+                    // Only calculate cache length once.
+                    if pos == 0 { len = bytes.len(); }
+
+                    // Write the bytes.
+                    stream.write(bytes.slice(pos, 
+                        if (pos + read_count) < len {
+                            // Haven't sent the whole file, so send read_count
+                            // more bytes.
+                            pos += read_count;
+                            pos
+                        }
+                        else {
+                            // These are the last bytes in the file. Write them
+                            // and exit the loop.
+                            eof = true;
+                            len
+                        }
+                    ));  
+                });
+            }
+        }
+        else { // File is not cached.
+            debug!("Waiting for mutex lock to cache a file.");
+            self.static_cache.access(|cache: &mut HashMap<~Path,~[u8]>| {
+                // Write the file while caching it. Note cache.insert returns
+                // true if the file did not already exist in the cache.
+                assert!(cache.insert(~path.clone(),
+                                     incr_write(&mut stream, path)) == true);
+            });
+        }
     }
     
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
@@ -405,7 +476,7 @@ impl WebServer {
             
             // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
             let stream = stream_port.recv();
-            WebServer::respond_with_static_file(stream, request.path);
+            self.respond_with_static_file(stream, request.path.clone());
             // Close stream automatically.
             debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
         }
