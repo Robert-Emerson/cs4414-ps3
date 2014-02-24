@@ -24,6 +24,7 @@ use std::hashmap::HashMap;
 
 use extra::getopts;
 use extra::arc::MutexArc;
+use extra::priority_queue::PriorityQueue;
 
 static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 
@@ -52,12 +53,21 @@ struct HTTP_Request {
     path: ~Path,
 }
 
+struct QueuedRequest {
+  priority: uint,
+  request: HTTP_Request,
+}
+
+impl Ord for QueuedRequest {
+  fn lt(&self, other: &QueuedRequest) -> bool {self.priority < other.priority}
+}
+
 struct WebServer {
     ip: ~str,
     port: uint,
     www_dir_path: ~Path,
     
-    request_queue_arc: MutexArc<~[HTTP_Request]>,
+    request_queue_arc: MutexArc<~PriorityQueue<QueuedRequest>>,
     stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>,
 
     static_cache: MutexArc<HashMap<~Path, ~[u8]>>,
@@ -79,7 +89,7 @@ impl WebServer {
             port: port,
             www_dir_path: www_dir_path,
                         
-            request_queue_arc: MutexArc::new(~[]),
+            request_queue_arc: MutexArc::new(~PriorityQueue::<QueuedRequest>::new()),
             stream_map_arc: MutexArc::new(HashMap::new()),
 
             static_cache: MutexArc::new(HashMap::new()),
@@ -408,7 +418,7 @@ impl WebServer {
     // TODO: Smarter Scheduling.
     fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>,
                                    path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>,
-                                   req_queue_arc: MutexArc<~[HTTP_Request]>,
+                                   req_queue_arc: MutexArc<~PriorityQueue<QueuedRequest>>,
                                    notify_chan: SharedChan<()>) {
         // Save stream in hashmap for later response.
         let mut stream = stream;
@@ -432,7 +442,7 @@ impl WebServer {
         req_queue_arc.access(|local_req_queue| {
             debug!("Got queue mutex lock.");
             let req: HTTP_Request = req_port.recv();
-            local_req_queue.push(req);
+            local_req_queue.push( QueuedRequest {priority: 0, request: req});//Change the priority depending on #3 and #5
             debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
         });
         
@@ -453,7 +463,7 @@ impl WebServer {
             self.notify_port.recv();    // waiting for new request enqueued.
             
             req_queue_get.access( |req_queue| {
-                match req_queue.shift_opt() { // FIFO queue.
+                match req_queue.maybe_pop() { // Priority Queue, pops off whatever has greatest value
                     None => { /* do nothing */ }
                     Some(req) => {
                         request_chan.send(req);
@@ -462,7 +472,7 @@ impl WebServer {
                 }
             });
             
-            let request = request_port.recv();
+            let request = request_port.recv().request;
             
             // Get stream from hashmap.
             // Use unsafe method, because TcpStream in Rust 0.9 doesn't have "Freeze" bound.
