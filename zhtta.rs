@@ -442,7 +442,17 @@ impl WebServer {
         req_queue_arc.access(|local_req_queue| {
             debug!("Got queue mutex lock.");
             let req: HTTP_Request = req_port.recv();
-            local_req_queue.push( QueuedRequest {priority: 0, request: req});//Change the priority depending on #3 and #5
+            let mut prior = 0;
+            
+            let ip1 : &str = "128.143.";
+            let ip2 : &str = "137.54.";
+            
+			if peer_name.slice_to(8).eq(&ip1) || peer_name.slice_to(7).eq(&ip2) {
+				prior = 6
+			}
+			
+            
+            local_req_queue.push( QueuedRequest {priority: prior, request: req});//Change the priority depending on #3 and #5
             debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
         });
         
