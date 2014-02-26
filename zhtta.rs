@@ -70,8 +70,6 @@ struct WebServer {
     request_queue_arc: MutexArc<~PriorityQueue<QueuedRequest>>,
     stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>,
 
-    static_cache: MutexArc<HashMap<~Path, ~[u8]>>,
-    
     notify_port: Port<()>,
     shared_notify_chan: SharedChan<()>,
     
@@ -92,8 +90,6 @@ impl WebServer {
             request_queue_arc: MutexArc::new(~PriorityQueue::<QueuedRequest>::new()),
             stream_map_arc: MutexArc::new(HashMap::new()),
 
-            static_cache: MutexArc::new(HashMap::new()),
-            
             notify_port: notify_port,
             shared_notify_chan: shared_notify_chan,
 	    
@@ -132,7 +128,7 @@ impl WebServer {
 		
                 // Spawn a task to handle the connection.
                 spawn(proc() {
-		    		let visitor_arc = count_port.recv();
+                    let visitor_arc = count_port.recv();
                     visitor_arc.access(|visitor_count| *visitor_count += 1); //Fixed unsafe counter
                     let request_queue_arc = queue_port.recv();
                   
@@ -206,22 +202,26 @@ impl WebServer {
 	})
     }
     
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>,
-                                cache: &mut HashMap<~Path,~[u8]>,
-                                path: &Path) {
-    	let mut stream = stream;
-    	let mut reader = File::open(path);
-    	stream.write(HTTP_OK.as_bytes());
-    	
-    	let read_count = 5242880; // Number of bytes to read at a time
-    	let mut error = None;
-    	while error.is_none() {
-    		let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
-    			.inside(|| reader.read_bytes(read_count));
-			stream.write(bytes);
-		}
+    fn stream_static_file(stream: &mut Option<std::io::net::tcp::TcpStream>,
+                  path: &Path) -> ~[u8] {
+        stream.write(HTTP_OK.as_bytes());
+        let read_count = 5242880; // Number of bytes to read at a time
+        let mut buffer: ~[u8] = ~[]; // Stores bytes while sending them
+        let mut reader = File::open(path).expect("Invalid file!");
+        let mut error = None;
+        debug!("Starting to read a file.");
+        while error.is_none() {
+            // Error becomes Some(_) when we reach EOF.
+            let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
+                    .inside(|| reader.read_bytes(read_count));
+            stream.write(bytes);
+            buffer = buffer + bytes;
+            debug!("Read {:u} bytes from file.", read_count);
+        }
+        debug!("Caching file of {:u} bytes.", buffer.len());
+        buffer // Return all read bytes
     }
-    
+
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
         let mut stream = stream;
         let mut file_reader = File::open(path).expect("Invalid file!");
@@ -400,8 +400,37 @@ impl WebServer {
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
-    
-    
+    }
+
+    fn spawn_semaphore(completion_port: Port<bool>, 
+                       new_task_chan: Chan<MutexArc<HashMap<~Path, ~[u8]>>>) {
+        let max_tasks = 3; // Semaphore occupies one task, so keep this < 4.
+        spawn(proc() {
+            // Counter for the number of response tasks active.
+            let mut response_tasks = 0;
+            // Dummy variable for static cache implementation
+            let static_cache: MutexArc<HashMap<Path, ~[u8]>>;
+            let static_cache = MutexArc::new(HashMap::new());
+            loop {
+                match completion_port.try_recv() {
+                    Some(_) => {
+                        response_tasks -= 1;
+                        debug!("{:d} tasks are running.", response_tasks+1);
+                    }
+                    None => { }
+                };
+                if response_tasks < max_tasks + 1 {
+                    // send a copy of the cache
+                    if new_task_chan.try_send(static_cache.clone()) {
+                        // There was a new task waiting in the queue.
+                        debug!("New task started! {:d} tasks are running.",
+                               response_tasks+1);
+                        response_tasks += 1;
+                    };
+                }
+                std::io::timer::sleep(100);
+            }
+        });
     }
     
     // TODO: Smarter Scheduling.
@@ -410,11 +439,16 @@ impl WebServer {
         let stream_map_get = self.stream_map_arc.clone();
         
         // Port<> cannot be sent to another task. So we have to make this task as the main task that can access self.notify_port.
-        
         let (request_port, request_chan) = Chan::new();
+
+        let (completion_port, completion_chan) = SharedChan::new();
+        let (new_task_port, new_task_chan) = Chan::new();
+        WebServer::spawn_semaphore(completion_port, new_task_chan);
+
         loop {
             self.notify_port.recv();    // waiting for new request enqueued.
-            
+            new_task_port.recv();
+
             req_queue_get.access( |req_queue| {
                 match req_queue.maybe_pop() { // Priority Queue, pops off whatever has greatest value
                     None => { /* do nothing */ }
@@ -426,7 +460,7 @@ impl WebServer {
             });
             
             let request = request_port.recv().request;
-            
+
             // Get stream from hashmap.
             // Use unsafe method, because TcpStream in Rust 0.9 doesn't have "Freeze" bound.
             let (stream_port, stream_chan) = Chan::new();
@@ -436,15 +470,17 @@ impl WebServer {
                     stream_chan.send(stream);
                 });
             }
-            
-            // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-            self.static_cache.access(|cache: &mut HashMap<~Path,~[u8]>| {
-                let stream = stream_port.recv();
-                let cache = cache;
-                WebServer::respond_with_static_file(stream, cache, request.path.clone());
+
+            let completion_chan = completion_chan.clone();
+            spawn(proc() {
+                debug!("Spawning static file transfer task.");
+                let mut stream = stream_port.recv();
+                let path = request.path.clone();
+                debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+                WebServer::stream_static_file(&mut stream, path);
+                // Close stream automatically.
+                completion_chan.send(true);
             });
-            // Close stream automatically.
-            debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
         }
     }
     
