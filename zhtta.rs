@@ -206,8 +206,8 @@ impl WebServer {
 	})
     }
     
-    fn respond_with_static_file(&mut self, 
-                                stream: Option<std::io::net::tcp::TcpStream>,
+    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>,
+                                cache: &mut HashMap<~Path,~[u8]>,
                                 path: &Path) {
         // Incrementally write the file to the TCP stream. Break gracefully at
         // EOF. Return the contents of the file.
@@ -232,8 +232,7 @@ impl WebServer {
         stream.write(HTTP_OK.as_bytes());
 
         debug!("Checking for file in cache from mutex lock.");
-        let cached = self.static_cache.access(|cache| 
-                          cache.contains_key(&~path.clone()));
+        let cached = cache.contains_key(&~path.clone());
         debug!("File cached: {:?}", cached);
 
         if cached { // File is cached.
@@ -246,39 +245,35 @@ impl WebServer {
             let read_count = 4096;
 
             while !eof {
-                self.static_cache.access(|cache: &mut HashMap<~Path,~[u8]>| {
-                    // Access the bytes in the cache.
-                    let bytes = cache.get(&~path.clone());
+                // Access the bytes in the cache.
+                let bytes = cache.get(&~path.clone());
 
-                    // Only calculate cache length once.
-                    if pos == 0 { len = bytes.len(); }
+                // Only calculate cache length once.
+                if pos == 0 { len = bytes.len(); }
 
-                    // Write the bytes.
-                    stream.write(bytes.slice(pos, 
-                        if (pos + read_count) < len {
-                            // Haven't sent the whole file, so send read_count
-                            // more bytes.
-                            pos += read_count;
-                            pos
-                        }
-                        else {
-                            // These are the last bytes in the file. Write them
-                            // and exit the loop.
-                            eof = true;
-                            len
-                        }
-                    ));  
-                });
+                // Write the bytes.
+                stream.write(bytes.slice(pos, 
+                    if (pos + read_count) < len {
+                        // Haven't sent the whole file, so send read_count
+                        // more bytes.
+                        pos += read_count;
+                        pos
+                    }
+                    else {
+                        // These are the last bytes in the file. Write them
+                        // and exit the loop.
+                        eof = true;
+                        len
+                    }
+                ));  
             }
         }
         else { // File is not cached.
             debug!("Waiting for mutex lock to cache a file.");
-            self.static_cache.access(|cache: &mut HashMap<~Path,~[u8]>| {
-                // Write the file while caching it. Note cache.insert returns
-                // true if the file did not already exist in the cache.
-                assert!(cache.insert(~path.clone(),
-                                     incr_write(&mut stream, path)) == true);
-            });
+            // Write the file while caching it. Note cache.insert returns
+            // true if the file did not already exist in the cache.
+            assert!(cache.insert(~path.clone(),
+                                    incr_write(&mut stream, path)) == true);
         }
     }
     
@@ -495,8 +490,11 @@ impl WebServer {
             }
             
             // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-            let stream = stream_port.recv();
-            self.respond_with_static_file(stream, request.path.clone());
+            self.static_cache.access(|cache: &mut HashMap<~Path,~[u8]>| {
+                let stream = stream_port.recv();
+                let cache = cache;
+                WebServer::respond_with_static_file(stream, cache, request.path.clone());
+            });
             // Close stream automatically.
             debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
         }
