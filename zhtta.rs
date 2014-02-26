@@ -245,35 +245,35 @@ impl WebServer {
             let read_count = 4096;
 
             while !eof {
-                    // Access the bytes in the cache.
-                    let bytes = cache.get(&~path.clone());
+                // Access the bytes in the cache.
+                let bytes = cache.get(&~path.clone());
 
-                    // Only calculate cache length once.
-                    if pos == 0 { len = bytes.len(); }
+                // Only calculate cache length once.
+                if pos == 0 { len = bytes.len(); }
 
-                    // Write the bytes.
-                    stream.write(bytes.slice(pos, 
-                        if (pos + read_count) < len {
-                            // Haven't sent the whole file, so send read_count
-                            // more bytes.
-                            pos += read_count;
-                            pos
-                        }
-                        else {
-                            // These are the last bytes in the file. Write them
-                            // and exit the loop.
-                            eof = true;
-                            len
-                        }
-                    ));  
+                // Write the bytes.
+                stream.write(bytes.slice(pos, 
+                    if (pos + read_count) < len {
+                        // Haven't sent the whole file, so send read_count
+                        // more bytes.
+                        pos += read_count;
+                        pos
+                    }
+                    else {
+                        // These are the last bytes in the file. Write them
+                        // and exit the loop.
+                        eof = true;
+                        len
+                    }
+                ));  
             }
         }
         else { // File is not cached.
             debug!("Waiting for mutex lock to cache a file.");
-                // Write the file while caching it. Note cache.insert returns
-                // true if the file did not already exist in the cache.
-                assert!(cache.insert(~path.clone(),
-                                     incr_write(&mut stream, path)) == true);
+            // Write the file while caching it. Note cache.insert returns
+            // true if the file did not already exist in the cache.
+            assert!(cache.insert(~path.clone(),
+                                    incr_write(&mut stream, path)) == true);
         }
     }
     
