@@ -41,6 +41,7 @@ static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, 
                     h2 { font-size:2cm; text-align: center; color: black; text-shadow: 0 0 4mm green }
              </style></head>
              <body>";
+static TASKS: uint = 12;
 
 mod gash;
 
@@ -66,12 +67,12 @@ struct WebServer {
     ip: ~str,
     port: uint,
     www_dir_path: ~Path,
+
+    tasks: uint,
     
     request_queue_arc: MutexArc<~PriorityQueue<QueuedRequest>>,
     stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>,
 
-    static_cache: MutexArc<HashMap<~Path, ~[u8]>>,
-    
     notify_port: Port<()>,
     shared_notify_chan: SharedChan<()>,
     
@@ -79,7 +80,7 @@ struct WebServer {
 }
 
 impl WebServer {
-    fn new(ip: &str, port: uint, www_dir: &str) -> WebServer {
+    fn new(ip: &str, port: uint, www_dir: &str, tasks: uint) -> WebServer {
         let (notify_port, shared_notify_chan) = SharedChan::new();
         let www_dir_path = ~Path::new(www_dir);
         os::change_dir(www_dir_path.clone());
@@ -88,12 +89,12 @@ impl WebServer {
             ip: ip.to_owned(),
             port: port,
             www_dir_path: www_dir_path,
+
+            tasks: tasks,
                         
             request_queue_arc: MutexArc::new(~PriorityQueue::<QueuedRequest>::new()),
             stream_map_arc: MutexArc::new(HashMap::new()),
 
-            static_cache: MutexArc::new(HashMap::new()),
-            
             notify_port: notify_port,
             shared_notify_chan: shared_notify_chan,
 	    
@@ -132,7 +133,7 @@ impl WebServer {
 		
                 // Spawn a task to handle the connection.
                 spawn(proc() {
-		    		let visitor_arc = count_port.recv();
+                    let visitor_arc = count_port.recv();
                     visitor_arc.access(|visitor_count| *visitor_count += 1); //Fixed unsafe counter
                     let request_queue_arc = queue_port.recv();
                   
@@ -206,22 +207,22 @@ impl WebServer {
 	})
     }
     
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>,
-                                cache: &mut HashMap<~Path,~[u8]>,
-                                path: &Path) {
-    	let mut stream = stream;
-    	let mut reader = File::open(path);
-    	stream.write(HTTP_OK.as_bytes());
-    	
-    	let read_count = 5242880; // Number of bytes to read at a time
-    	let mut error = None;
-    	while error.is_none() {
-    		let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
-    			.inside(|| reader.read_bytes(read_count));
-			stream.write(bytes);
-		}
+    fn stream_static_file(stream: &mut Option<std::io::net::tcp::TcpStream>,
+                  path: &Path) {
+        stream.write(HTTP_OK.as_bytes());
+        let read_count = 5242880; // Number of bytes to read at a time
+        let mut reader = File::open(path).expect("Invalid file!");
+        let mut error = None;
+        debug!("Starting to read a file.");
+        while error.is_none() {
+            // Error becomes Some(_) when we reach EOF.
+            let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
+                    .inside(|| reader.read_bytes(read_count));
+            stream.write(bytes);
+            debug!("Read {:u} bytes from file.", read_count);
+        }
     }
-    
+
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
         let mut stream = stream;
         let mut file_reader = File::open(path).expect("Invalid file!");
@@ -400,8 +401,37 @@ impl WebServer {
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
-    
-    
+    }
+
+    fn spawn_semaphore(completion_port: Port<bool>, 
+                       new_task_chan: Chan<MutexArc<HashMap<~Path, ~[u8]>>>,
+                       max_tasks: uint) {
+        spawn(proc() {
+            // Counter for the number of response tasks active.
+            let mut response_tasks = 0;
+            // Dummy variable for static cache implementation
+            let static_cache: MutexArc<HashMap<Path, ~[u8]>>;
+            let static_cache = MutexArc::new(HashMap::new());
+            loop {
+                match completion_port.try_recv() {
+                    Some(_) => {
+                        response_tasks -= 1;
+                        debug!("{:u} tasks are running.", response_tasks+1);
+                    }
+                    None => { }
+                };
+                if response_tasks < max_tasks + 1 {
+                    // send a copy of the cache
+                    if new_task_chan.try_send(static_cache.clone()) {
+                        // There was a new task waiting in the queue.
+                        debug!("New task started! {:u} tasks are running.",
+                               response_tasks+1);
+                        response_tasks += 1;
+                    };
+                }
+                std::io::timer::sleep(100);
+            }
+        });
     }
     
     // TODO: Smarter Scheduling.
@@ -410,11 +440,16 @@ impl WebServer {
         let stream_map_get = self.stream_map_arc.clone();
         
         // Port<> cannot be sent to another task. So we have to make this task as the main task that can access self.notify_port.
-        
         let (request_port, request_chan) = Chan::new();
+
+        let (completion_port, completion_chan) = SharedChan::new();
+        let (new_task_port, new_task_chan) = Chan::new();
+        WebServer::spawn_semaphore(completion_port, new_task_chan, self.tasks);
+
         loop {
             self.notify_port.recv();    // waiting for new request enqueued.
-            
+            new_task_port.recv();
+
             req_queue_get.access( |req_queue| {
                 match req_queue.maybe_pop() { // Priority Queue, pops off whatever has greatest value
                     None => { /* do nothing */ }
@@ -426,7 +461,7 @@ impl WebServer {
             });
             
             let request = request_port.recv().request;
-            
+
             // Get stream from hashmap.
             // Use unsafe method, because TcpStream in Rust 0.9 doesn't have "Freeze" bound.
             let (stream_port, stream_chan) = Chan::new();
@@ -436,15 +471,17 @@ impl WebServer {
                     stream_chan.send(stream);
                 });
             }
-            
-            // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-            self.static_cache.access(|cache: &mut HashMap<~Path,~[u8]>| {
-                let stream = stream_port.recv();
-                let cache = cache;
-                WebServer::respond_with_static_file(stream, cache, request.path.clone());
+
+            let completion_chan = completion_chan.clone();
+            spawn(proc() {
+                debug!("Spawning static file transfer task.");
+                let mut stream = stream_port.recv();
+                let path = request.path.clone();
+                debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+                WebServer::stream_static_file(&mut stream, path);
+                // Close stream automatically.
+                completion_chan.send(true);
             });
-            // Close stream automatically.
-            debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
         }
     }
     
@@ -476,11 +513,12 @@ impl WebServer {
     }
 }
 
-fn get_args() -> (~str, uint, ~str) {
+fn get_args() -> (~str, uint, ~str, uint) {
     fn print_usage(program: &str) {
         println!("Usage: {:s} [options]", program);
         println!("--ip     \tIP address, \"{:s}\" by default.", IP);
         println!("--port   \tport number, \"{:u}\" by default.", PORT);
+        println!("--tasks  \tmax tasks, \"{:u}\" by default.", TASKS);
         println!("--www    \tworking directory, \"{:s}\" by default", WWW_DIR);
         println("-h --help \tUsage");
     }
@@ -492,6 +530,7 @@ fn get_args() -> (~str, uint, ~str) {
     let opts = ~[
         getopts::optopt("ip"),
         getopts::optopt("port"),
+        getopts::optopt("tasks"),
         getopts::optopt("www"),
         getopts::optflag("h"),
         getopts::optflag("help")
@@ -522,12 +561,18 @@ fn get_args() -> (~str, uint, ~str) {
     let www_dir_str = if matches.opt_present("www") {
                         matches.opt_str("www").expect("invalid www argument?") 
                       } else { WWW_DIR.to_owned() };
-    
-    (ip_str, port, www_dir_str)
+
+    let tasks:uint = if matches.opt_present("tasks") {
+                        from_str::from_str(matches.opt_str("tasks").expect("invalid tasks number?")).expect("not uint?")
+                    } else {
+                        TASKS
+                    };
+    debug!("Using {:u} max response tasks.", tasks);
+    (ip_str, port, www_dir_str, tasks)
 }
 
 fn main() {
-    let (ip_str, port, www_dir_str) = get_args();
-    let mut zhtta = WebServer::new(ip_str, port, www_dir_str);
+    let (ip_str, port, www_dir_str, tasks) = get_args();
+    let mut zhtta = WebServer::new(ip_str, port, www_dir_str, tasks);
     zhtta.run();
 }
