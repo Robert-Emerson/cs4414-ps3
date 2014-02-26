@@ -416,17 +416,17 @@ impl WebServer {
                 match completion_port.try_recv() {
                     Some(_) => {
                         response_tasks -= 1;
-                        debug!("{:u} tasks are running.", response_tasks+1);
+                        debug!("{:u} tasks are running.", response_tasks);
                     }
                     None => { }
                 };
-                if response_tasks < max_tasks + 1 {
+                if response_tasks < max_tasks {
                     // send a copy of the cache
                     if new_task_chan.try_send(static_cache.clone()) {
                         // There was a new task waiting in the queue.
-                        debug!("New task started! {:u} tasks are running.",
-                               response_tasks+1);
                         response_tasks += 1;
+                        debug!("New task started! {:u} tasks are running.",
+                               response_tasks);
                     };
                 }
                 std::io::timer::sleep(100);
@@ -474,8 +474,8 @@ impl WebServer {
 
             let completion_chan = completion_chan.clone();
             spawn(proc() {
-                debug!("Spawning static file transfer task.");
                 let mut stream = stream_port.recv();
+                debug!("Spawning static file transfer task.");
                 let path = request.path.clone();
                 debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
                 WebServer::stream_static_file(&mut stream, path);
