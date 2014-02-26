@@ -113,7 +113,7 @@ impl WebServer {
         let request_queue_arc = self.request_queue_arc.clone();
         let shared_notify_chan = self.shared_notify_chan.clone();
         let stream_map_arc = self.stream_map_arc.clone();
-	let visitor_arc = self.visitor_arc.clone();
+		let visitor_arc = self.visitor_arc.clone();
                 
         spawn(proc() {
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
@@ -132,7 +132,7 @@ impl WebServer {
 		
                 // Spawn a task to handle the connection.
                 spawn(proc() {
-		    let visitor_arc = count_port.recv();
+		    		let visitor_arc = count_port.recv();
                     visitor_arc.access(|visitor_count| *visitor_count += 1); //Fixed unsafe counter
                     let request_queue_arc = queue_port.recv();
                   
@@ -209,72 +209,17 @@ impl WebServer {
     fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>,
                                 cache: &mut HashMap<~Path,~[u8]>,
                                 path: &Path) {
-        // Incrementally write the file to the TCP stream. Break gracefully at
-        // EOF. Return the contents of the file.
-        fn incr_write(stream: &mut Option<std::io::net::tcp::TcpStream>,
-                    path: &Path) -> ~[u8] {
-            let read_count = 4096; // Number of bytes to read at a time
-            let mut buffer: ~[u8] = ~[]; // Stores bytes while sending them
-            let mut reader = File::open(path).expect("Invalid file!");
-            let mut error = None;
-            while error.is_none() {
-                // Error becomes Some(_) when we reach EOF.
-                let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
-                        .inside(|| reader.read_bytes(read_count));
-                stream.write(bytes);
-                buffer = buffer + bytes;
-            }
-            debug!("Cached {:u} bytes", buffer.len());
-            buffer // Return all read bytes
-        }
-        let mut stream = stream;
-
-        stream.write(HTTP_OK.as_bytes());
-
-        debug!("Checking for file in cache from mutex lock.");
-        let cached = cache.contains_key(&~path.clone());
-        debug!("File cached: {:?}", cached);
-
-        if cached { // File is cached.
-            let mut eof = false; // True when we're at the end of the cache.
-
-            let mut pos = 0; // Position in cache.
-            let mut len = 0; // Length of cache.
-
-            // Number of bytes to read from cache before re-acquiring the lock.
-            let read_count = 4096;
-
-            while !eof {
-                // Access the bytes in the cache.
-                let bytes = cache.get(&~path.clone());
-
-                // Only calculate cache length once.
-                if pos == 0 { len = bytes.len(); }
-
-                // Write the bytes.
-                stream.write(bytes.slice(pos, 
-                    if (pos + read_count) < len {
-                        // Haven't sent the whole file, so send read_count
-                        // more bytes.
-                        pos += read_count;
-                        pos
-                    }
-                    else {
-                        // These are the last bytes in the file. Write them
-                        // and exit the loop.
-                        eof = true;
-                        len
-                    }
-                ));  
-            }
-        }
-        else { // File is not cached.
-            debug!("Waiting for mutex lock to cache a file.");
-            // Write the file while caching it. Note cache.insert returns
-            // true if the file did not already exist in the cache.
-            assert!(cache.insert(~path.clone(),
-                                    incr_write(&mut stream, path)) == true);
-        }
+    	let mut stream = stream;
+    	let mut reader = File::open(path);
+    	stream.write(HTTP_OK.as_bytes());
+    	
+    	let read_count = 5242880; // Number of bytes to read at a time
+    	let mut error = None;
+    	while error.is_none() {
+    		let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
+    			.inside(|| reader.read_bytes(read_count));
+			stream.write(bytes);
+		}
     }
     
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
@@ -443,8 +388,11 @@ impl WebServer {
             let ip2 : &str = "137.54.";
             
 			if peer_name.slice_to(8).eq(&ip1) || peer_name.slice_to(7).eq(&ip2) {
-				prior = 6
+				prior = 9;
 			}
+			
+			let size_prior = WebServer::get_size_priority(path_obj);
+			prior += size_prior;
 			
             
             local_req_queue.push( QueuedRequest {priority: prior, request: req});//Change the priority depending on #3 and #5
@@ -510,6 +458,21 @@ impl WebServer {
                        },
             None => (~"")
         }
+    }
+    
+    // Returns the size priority based on the file size in bytes. Smaller files are given a higher priority, larger files a lower priority.
+    fn get_size_priority(path: &Path) -> uint {
+		let file = path.stat();
+		let size = file.size;
+		if (size < 5120) { return 8; }		// 5K
+		if (size < 5242880) { return 7;	}	// 5M
+		if (size < 10485760) { return 6; }	// 10M
+		if (size < 20971520) { return 5; }	// 20M
+		if (size < 41943040) { return 4; }	// 40M
+		if (size < 83886080) { return 3; }	// 80M
+		if (size < 536870912) {	return 2; }	// 512M
+		return 1;
+
     }
 }
 
