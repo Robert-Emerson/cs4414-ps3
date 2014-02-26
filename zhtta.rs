@@ -203,10 +203,9 @@ impl WebServer {
     }
     
     fn stream_static_file(stream: &mut Option<std::io::net::tcp::TcpStream>,
-                  path: &Path) -> ~[u8] {
+                  path: &Path) {
         stream.write(HTTP_OK.as_bytes());
         let read_count = 5242880; // Number of bytes to read at a time
-        let mut buffer: ~[u8] = ~[]; // Stores bytes while sending them
         let mut reader = File::open(path).expect("Invalid file!");
         let mut error = None;
         debug!("Starting to read a file.");
@@ -215,11 +214,8 @@ impl WebServer {
             let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
                     .inside(|| reader.read_bytes(read_count));
             stream.write(bytes);
-            buffer = buffer + bytes;
             debug!("Read {:u} bytes from file.", read_count);
         }
-        debug!("Caching file of {:u} bytes.", buffer.len());
-        buffer // Return all read bytes
     }
 
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
@@ -404,7 +400,7 @@ impl WebServer {
 
     fn spawn_semaphore(completion_port: Port<bool>, 
                        new_task_chan: Chan<MutexArc<HashMap<~Path, ~[u8]>>>) {
-        let max_tasks = 3; // Semaphore occupies one task, so keep this < 4.
+        let max_tasks = 4;
         spawn(proc() {
             // Counter for the number of response tasks active.
             let mut response_tasks = 0;
