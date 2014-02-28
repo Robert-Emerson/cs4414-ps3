@@ -24,6 +24,7 @@ use std::hashmap::HashMap;
 
 use extra::getopts;
 use extra::arc::MutexArc;
+use extra::arc::RWArc;
 use extra::priority_queue::PriorityQueue;
 
 static SERVER_NAME : &'static str = "Zhtta Version 0.5";
@@ -41,7 +42,7 @@ static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, 
                     h2 { font-size:2cm; text-align: center; color: black; text-shadow: 0 0 4mm green }
              </style></head>
              <body>";
-static TASKS: uint = 12;
+static TASKS: uint = 8;
 
 mod gash;
 
@@ -208,19 +209,67 @@ impl WebServer {
     }
     
     fn stream_static_file(stream: &mut Option<std::io::net::tcp::TcpStream>,
-                  path: &Path) {
-        stream.write(HTTP_OK.as_bytes());
-        let read_count = 5242880; // Number of bytes to read at a time
-        let mut reader = File::open(path).expect("Invalid file!");
-        let mut error = None;
-        debug!("Starting to read a file.");
-        while error.is_none() {
-            // Error becomes Some(_) when we reach EOF.
-            let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
-                    .inside(|| reader.read_bytes(read_count));
-            stream.write(bytes);
-            debug!("Read {:u} bytes from file.", read_count);
-        }
+                  path: &Path, 
+		  cache: RWArc<HashMap<~Path, ~[u8]>> ) {
+	let cached = cache.read(|cache| cache.contains_key(&~path.clone())); // Checks if file is in cache
+	let read_count = 5242880; // Number of bytes to read at a time
+	
+	stream.write(HTTP_OK.as_bytes());
+	    
+	if !cached {
+	    
+	    // Spawn a new proc to update cache in background
+	    let (cache_port, cache_chan) = Chan::new();
+	    cache_chan.send(cache);
+	    let path_string = (path.as_str().unwrap().to_owned()); //We can pass strings, but not Paths
+	    
+	    spawn( proc() {
+		let cache = cache_port.recv();
+		let path = Path::new(path_string);
+		let mut reader = File::open(&path).expect("Invalid file!");
+		
+		cache.write(|cache| cache.insert(~path.clone(), reader.read_to_end()));
+	      
+	    });
+	    
+	    // Respond to request with stream
+	    let mut reader = File::open(path).expect("Invalid file!");
+	    let mut error = None;
+	    debug!("Starting to read a file.");
+	    while error.is_none() {
+		// Error becomes Some(_) when we reach EOF.
+		let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
+			.inside(|| reader.read_bytes(read_count));
+		stream.write(bytes);
+		debug!("Read {:u} bytes from file.", read_count);
+	    }
+	    
+	} else { //File must already be cached
+	    debug!("Reading file from cache");
+	    let mut eof = false; // True when we're at the end of the cached file
+	    let mut pos = 0; // Position in cached file_reader
+	    let mut len = 0; // Length of cached file
+	    while !eof {
+		cache.read(|cache| {
+		    
+		    let bytes = cache.get(&~path.clone());
+		    
+		    if pos == 0 { len = bytes.len(); } //Do this so we only calculate length once
+		    stream.write( bytes.slice(pos, 
+			  if (pos + read_count) < len {
+			      // Haven't read all of the file, just keep going!
+			      pos += read_count;
+			      pos			    
+			  } else {
+			      //These are the last bytes. Sprint to the finish!
+			      eof = true;
+			      len
+			  }
+		    ));
+		});
+	    }
+	    
+	}
     }
 
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
@@ -404,14 +453,14 @@ impl WebServer {
     }
 
     fn spawn_semaphore(completion_port: Port<bool>, 
-                       new_task_chan: Chan<MutexArc<HashMap<~Path, ~[u8]>>>,
+                       new_task_chan: Chan<RWArc<HashMap<~Path, ~[u8]>>>,
                        max_tasks: uint) {
         spawn(proc() {
             // Counter for the number of response tasks active.
             let mut response_tasks = 0;
-            // Dummy variable for static cache implementation
-            let static_cache: MutexArc<HashMap<Path, ~[u8]>>;
-            let static_cache = MutexArc::new(HashMap::new());
+            // Variable for cache implementation. Uses a RWArc to avoid deadlock situations
+            let static_cache: RWArc<HashMap<Path, ~[u8]>>;
+	    let static_cache = RWArc::new(HashMap::new());
             loop {
                 match completion_port.try_recv() {
                     Some(_) => {
@@ -429,7 +478,7 @@ impl WebServer {
                                response_tasks);
                     };
                 }
-                std::io::timer::sleep(100);
+                std::io::timer::sleep(1);
             }
         });
     }
@@ -448,7 +497,7 @@ impl WebServer {
 
         loop {
             self.notify_port.recv();    // waiting for new request enqueued.
-            new_task_port.recv();
+            let cache = new_task_port.recv(); // Get the cache from spawn_semaphore
 
             req_queue_get.access( |req_queue| {
                 match req_queue.maybe_pop() { // Priority Queue, pops off whatever has greatest value
@@ -471,14 +520,19 @@ impl WebServer {
                     stream_chan.send(stream);
                 });
             }
-
+	    
+	    let (cache_port, cache_chan) = Chan::new();
             let completion_chan = completion_chan.clone();
+	    
+	    cache_chan.send(cache);
             spawn(proc() {
                 let mut stream = stream_port.recv();
+		let cache = cache_port.recv();
+
                 debug!("Spawning static file transfer task.");
                 let path = request.path.clone();
                 debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
-                WebServer::stream_static_file(&mut stream, path);
+                WebServer::stream_static_file(&mut stream, path, cache);
                 // Close stream automatically.
                 completion_chan.send(true);
             });
