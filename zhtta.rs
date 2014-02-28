@@ -214,8 +214,6 @@ impl WebServer {
 	
 	let read_count = 4096; // Number of bytes to read at a time
 	
-	stream.write(HTTP_OK.as_bytes());
-
 	// Spawn a new proc to update cache in background
 	let (cache_port, cache_chan) = Chan::new();
 	cache_chan.send(cache);
