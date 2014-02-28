@@ -498,6 +498,7 @@ impl WebServer {
 	    cache_chan.send(cache);
             spawn(proc() {
                 let mut stream = stream_port.recv();
+                stream.write(HTTP_OK.as_bytes());
 		let cache = cache_port.recv();
 
                 debug!("Spawning static file transfer task.");
@@ -508,7 +509,6 @@ impl WebServer {
 		if !cached {
 		    WebServer::stream_static_file(&mut stream, path, cache);
 		} else {
-		    stream.write(HTTP_OK.as_bytes());
 		    cache.read(|cache| {
 		    
 			let bytes = cache.get(&path.clone());
