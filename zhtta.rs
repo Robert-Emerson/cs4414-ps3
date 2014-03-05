@@ -507,7 +507,6 @@ impl WebServer {
 
         loop {
             self.notify_port.recv();    // waiting for new request enqueued.
-
             let (stream_port, stream_chan) = Chan::new();
 
             // Get the corresponding request/stream.
@@ -535,20 +534,20 @@ impl WebServer {
             });
            
             // Get the request
-            let req = request_port.recv().request;
 
 	    let (cache_port, cache_chan) = Chan::new();
             let completion_chan = completion_chan.clone();
             // Wait until the new_task_port is sent to do the spawning.
 	    cache_chan.send(new_task_port.recv());
+            let req = request_port.recv().request;
             debug!("Spawning static file transfer task.");
             spawn(proc() {
-                debug!("=====Terminated connection from [{:s}].=====", req.peer_name);
                 // Send the stream and cache as a port, only start using the
                 // task once they're both ready.
                 WebServer::stream_static_file(stream_port, req.path, cache_port);
                 // Close stream automatically.
                 completion_chan.send(true);
+                debug!("=====Terminated connection from [{:s}].=====", req.peer_name);
             });
         }
     }
