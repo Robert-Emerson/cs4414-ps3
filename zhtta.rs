@@ -42,7 +42,7 @@ static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, 
                     h2 { font-size:2cm; text-align: center; color: black; text-shadow: 0 0 4mm green }
              </style></head>
              <body>";
-static TASKS: uint = 8000;
+static TASKS: uint = 64;
 
 mod gash;
 
@@ -262,7 +262,7 @@ impl WebServer {
             });
             // Respond to request with stream
             let mut reader = File::open(path).expect("Invalid file!");
-            let read_count = 4096; // Number of bytes to read at a time
+            let read_count = 5242880; // Number of bytes to read at a time
             let mut error = None;
             debug!("Starting to read a file.");
             while error.is_none() {
