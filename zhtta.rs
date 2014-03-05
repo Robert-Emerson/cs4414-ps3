@@ -160,7 +160,7 @@ impl WebServer {
                 spawn(proc() {
                     let visitor_arc = count_port.recv();
                     visitor_arc.access(|visitor_count| *visitor_count += 1); //Fixed unsafe counter
-                   // let request_queue_arc = queue_port.recv();
+                    let request_queue_arc = queue_port.recv();
                   
                     let mut stream = stream;
                     
@@ -210,7 +210,7 @@ impl WebServer {
                                 stream_chan.send(~stream);
                                 WebServer::stream_static_file(stream_port, path_obj, small_cache_port);
                             } else {
-                                WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, queue_port.recv(), notify_chan);
+                                WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
                             }
                         }
                     }
