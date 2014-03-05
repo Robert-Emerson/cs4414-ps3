@@ -55,6 +55,15 @@ struct HTTP_Request {
     path: ~Path,
 }
 
+impl Clone for HTTP_Request {
+    fn clone(&self) -> HTTP_Request {
+        HTTP_Request {
+            peer_name: self.peer_name.clone(),
+            path: self.path.clone(),
+        }
+    }
+}
+
 struct QueuedRequest {
   priority: uint,
   request: HTTP_Request,
@@ -62,6 +71,15 @@ struct QueuedRequest {
 
 impl Ord for QueuedRequest {
   fn lt(&self, other: &QueuedRequest) -> bool {self.priority < other.priority}
+}
+
+impl Clone for QueuedRequest {
+    fn clone(&self) -> QueuedRequest {
+        QueuedRequest {
+            priority: self.priority.clone(),
+            request: self.request.clone(),
+        }
+    }
 }
 
 struct WebServer {
@@ -115,17 +133,15 @@ impl WebServer {
         let request_queue_arc = self.request_queue_arc.clone();
         let shared_notify_chan = self.shared_notify_chan.clone();
         let stream_map_arc = self.stream_map_arc.clone();
-		let visitor_arc = self.visitor_arc.clone();
+        let visitor_arc = self.visitor_arc.clone();
+        let max_immediate_file_size = 5120;
                 
         spawn(proc() {
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
             println!("{:s} listening on {:s} (serving from: {:s}).", 
                      SERVER_NAME, addr.to_str(), www_dir_path_str);
                      
-            let small_file_cache: RWArc<HashMap<Path, ~[u8]>>;
-	    	let small_file_cache = RWArc::new(HashMap::new());
-            
-
+            let small_file_cache = RWArc::new(~HashMap::new());
             
             for stream in acceptor.incoming() {
                 let (queue_port, queue_chan) = Chan::new();
@@ -138,7 +154,7 @@ impl WebServer {
                 count_chan.send(visitor_arc.clone());
                 
                 let (small_cache_port, small_cache_chan) = Chan::new();
-	            small_cache_chan.send(small_file_cache.clone());
+                small_cache_chan.send(small_file_cache.clone());
 		
                 // Spawn a task to handle the connection.
                 spawn(proc() {
@@ -184,25 +200,17 @@ impl WebServer {
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else { 
                             debug!("===== Static Page request =====");
-						   	let file = path_obj.stat();
-							let size = file.size;
-							debug!("Size to check: [{:}]", file.size);
-							if size <= 5120 {
-								let cache = small_cache_port.recv();
-								stream.write(HTTP_OK.as_bytes());
-								let cached = cache.read(|cache| cache.contains_key(&path_obj.clone())); // Checks if file is in cache
-								if !cached {
-									WebServer::stream_static_file(&mut stream, path_obj, cache);
-								} else {
-									cache.read(|cache| {
-										let bytes = cache.get(&path_obj.clone());
-										stream.write(bytes.slice_from(0));
-									});
-								}
-	
-							} else {
-	                        	WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
-	                        }
+                            let file = path_obj.stat();
+                            let size = file.size;
+                            debug!("Size to check: [{:}]", file.size);
+                            if size <= max_immediate_file_size {
+                                stream.write(HTTP_OK.as_bytes());
+                                let (stream_port, stream_chan) = Chan::new();
+                                stream_chan.send(~stream);
+                                WebServer::stream_static_file(stream_port, path_obj, small_cache_port);
+                            } else {
+                                WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+                            }
                         }
                     }
                 });
@@ -234,37 +242,44 @@ impl WebServer {
 	})
     }
     
-    fn stream_static_file(stream: &mut Option<std::io::net::tcp::TcpStream>,
-                  path: &Path, cache: RWArc<HashMap<~Path, ~[u8]>> ) {
-	
-		let read_count = 4096; // Number of bytes to read at a time
-	
-		// Spawn a new proc to update cache in background
-		let (cache_port, cache_chan) = Chan::new();
-		cache_chan.send(cache);
-		let path_string = (path.as_str().unwrap().to_owned()); //We can pass strings, but not Paths
-	
-		spawn( proc() {
-			let cache = cache_port.recv();
-			let path = Path::new(path_string);
-			let mut reader = File::open(&path).expect("Invalid file!");
-			
-			cache.write(|cache| cache.insert(~path.clone(), reader.read_to_end()));
-		  
-		});
-	
-		// Respond to request with stream
-		let mut reader = File::open(path).expect("Invalid file!");
-		let mut error = None;
-		debug!("Starting to read a file.");
-		while error.is_none() {
-			// Error becomes Some(_) when we reach EOF.
-			let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
-				.inside(|| reader.read_bytes(read_count));
-			stream.write(bytes);
-			debug!("Read {:u} bytes from file.", read_count);
-		}
+    fn stream_static_file(stream_port: Port<~Option<std::io::net::tcp::TcpStream>>,
+                  path: &Path, 
+		  cache_port: Port<RWArc<~HashMap<~Path, ~[u8]>>> ) {
+        // Get the stream first; least likely to block.
+        let mut stream = stream_port.recv();
+        // This task will block until the port is received.
+        let cache = cache_port.recv();	
+        let cached = cache.read(|cache| cache.contains_key(&~path.clone()));
+        if (!cached) {
+            // Spawn a new proc to update cache in background
+            let path_string = (path.as_str().unwrap().to_owned());
+            spawn(proc() {
+                let path = Path::new(path_string);
+                cache.write(|cache| cache.insert(~path.clone(), 
+                                                 File::open(&path)
+                                                 .expect("Invalid file!")
+                                                 .read_to_end()));
+            });
+            // Respond to request with stream
+            let mut reader = File::open(path).expect("Invalid file!");
+            let read_count = 4096; // Number of bytes to read at a time
+            let mut error = None;
+            debug!("Starting to read a file.");
+            while error.is_none() {
+                // Error becomes Some(_) when we reach EOF.
+                let bytes = io_error::cond.trap(|e: IoError| error = Some(e))
+                        .inside(|| reader.read_bytes(read_count));
+                stream.write(bytes);
+                debug!("Read {:u} bytes from file.", read_count);
+            }
+        } else {
+            cache.read(|cache| {
+                let bytes = cache.get(&~path.clone());
+                stream.write( bytes.slice_from(0));
+            });
+        }
     }
+
 
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
         let mut stream = stream;
@@ -450,14 +465,13 @@ impl WebServer {
     }
 
     fn spawn_semaphore(completion_port: Port<bool>, 
-                       new_task_chan: Chan<RWArc<HashMap<~Path, ~[u8]>>>,
+                       new_task_chan: Chan<RWArc<~HashMap<~Path, ~[u8]>>>,
                        max_tasks: uint) {
         spawn(proc() {
             // Counter for the number of response tasks active.
             let mut response_tasks = 0;
             // Variable for cache implementation. Uses a RWArc to avoid deadlock situations
-            let static_cache: RWArc<HashMap<Path, ~[u8]>>;
-	    	let static_cache = RWArc::new(HashMap::new());
+	    let static_cache = RWArc::new(~HashMap::new());
             loop {
                 match completion_port.try_recv() {
                     Some(_) => {
@@ -479,8 +493,7 @@ impl WebServer {
             }
         });
     }
-    
-    // TODO: Smarter Scheduling.
+
     fn dequeue_static_file_request(&mut self) {
         let req_queue_get = self.request_queue_arc.clone();
         let stream_map_get = self.stream_map_arc.clone();
@@ -494,54 +507,48 @@ impl WebServer {
 
         loop {
             self.notify_port.recv();    // waiting for new request enqueued.
-            let cache = new_task_port.recv(); // Get the cache from spawn_semaphore
 
+            let (stream_port, stream_chan) = Chan::new();
+
+            // Get the corresponding request/stream.
             req_queue_get.access( |req_queue| {
                 match req_queue.maybe_pop() { // Priority Queue, pops off whatever has greatest value
                     None => { /* do nothing */ }
                     Some(req) => {
-                        request_chan.send(req);
-                        debug!("A new request dequeued, now the length of queue is {:u}.", req_queue.len());
+                        request_chan.send(req.clone());
+                        debug!("A new request dequeued, now the length of\
+                               queue is {:u}.", req_queue.len());
+                        // Only bother getting the stream for something that
+                        // came out of the priority queue.
+
+                        // Get stream from hashmap.
+                        // Use unsafe method, because TcpStream in Rust 0.9 doesn't have "Freeze" bound.
+                        unsafe {
+                            stream_map_get.unsafe_access(|local_stream_map| {
+                                let mut stream = local_stream_map.pop(&req.request.peer_name).expect("no option tcpstream");
+                                stream.write(HTTP_OK.as_bytes());
+                                stream_chan.send(~stream);
+                            });
+                        }
                     }
                 }
             });
-            
-            let request = request_port.recv().request;
+           
+            // Get the request
+            let req = request_port.recv().request;
 
-            // Get stream from hashmap.
-            // Use unsafe method, because TcpStream in Rust 0.9 doesn't have "Freeze" bound.
-            let (stream_port, stream_chan) = Chan::new();
-            unsafe {
-                stream_map_get.unsafe_access(|local_stream_map| {
-                    let stream = local_stream_map.pop(&request.peer_name).expect("no option tcpstream");
-                    stream_chan.send(stream);
-                });
-            }
-	    
-	    	let (cache_port, cache_chan) = Chan::new();
+	    let (cache_port, cache_chan) = Chan::new();
             let completion_chan = completion_chan.clone();
-	    
-	   		cache_chan.send(cache);
+            // Wait until the new_task_port is sent to do the spawning.
+	    cache_chan.send(new_task_port.recv());
+            debug!("Spawning static file transfer task.");
             spawn(proc() {
-                let mut stream = stream_port.recv();
-                stream.write(HTTP_OK.as_bytes());
-				let cache = cache_port.recv();
-				debug!("Spawning static file transfer task.");
-				let path = request.path.clone();
-				debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
-				let cached = cache.read(|cache| cache.contains_key(&path.clone())); // Checks if file is in cache
-				        //From office hours, if it's cached just respond here. Also, don't stream from cache
-				if !cached {
-					WebServer::stream_static_file(&mut stream, path, cache);
-				} else {
-					cache.read(|cache| {
-				
-					let bytes = cache.get(&path.clone());
-					stream.write( bytes.slice_from(0));
-					});
-				}
-				        // Close stream automatically.
-				        completion_chan.send(true);
+                debug!("=====Terminated connection from [{:s}].=====", req.peer_name);
+                // Send the stream and cache as a port, only start using the
+                // task once they're both ready.
+                WebServer::stream_static_file(stream_port, req.path, cache_port);
+                // Close stream automatically.
+                completion_chan.send(true);
             });
         }
     }
