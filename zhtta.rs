@@ -160,7 +160,7 @@ impl WebServer {
                 spawn(proc() {
                     let visitor_arc = count_port.recv();
                     visitor_arc.access(|visitor_count| *visitor_count += 1); //Fixed unsafe counter
-                    let request_queue_arc = queue_port.recv();
+                   // let request_queue_arc = queue_port.recv();
                   
                     let mut stream = stream;
                     
@@ -200,16 +200,17 @@ impl WebServer {
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else { 
                             debug!("===== Static Page request =====");
+			    stream.write(HTTP_OK.as_bytes());
                             let file = path_obj.stat();
                             let size = file.size;
                             debug!("Size to check: [{:}]", file.size);
                             if size <= max_immediate_file_size {
-                                stream.write(HTTP_OK.as_bytes());
+
                                 let (stream_port, stream_chan) = Chan::new();
                                 stream_chan.send(~stream);
                                 WebServer::stream_static_file(stream_port, path_obj, small_cache_port);
                             } else {
-                                WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+                                WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, queue_port.recv(), notify_chan);
                             }
                         }
                     }
@@ -526,7 +527,6 @@ impl WebServer {
                         unsafe {
                             stream_map_get.unsafe_access(|local_stream_map| {
                                 let mut stream = local_stream_map.pop(&req.request.peer_name).expect("no option tcpstream");
-                                stream.write(HTTP_OK.as_bytes());
                                 stream_chan.send(~stream);
                             });
                         }
@@ -534,21 +534,24 @@ impl WebServer {
                 }
             });
            
-            // Get the request
-            let req = request_port.recv().request;
-
+            
 	    let (cache_port, cache_chan) = Chan::new();
             let completion_chan = completion_chan.clone();
             // Wait until the new_task_port is sent to do the spawning.
 	    cache_chan.send(new_task_port.recv());
-            debug!("Spawning static file transfer task.");
+            // Get the request
+            let req = request_port.recv().request;
+
+	    debug!("Spawning static file transfer task.");
             spawn(proc() {
-                debug!("=====Terminated connection from [{:s}].=====", req.peer_name);
+
                 // Send the stream and cache as a port, only start using the
                 // task once they're both ready.
                 WebServer::stream_static_file(stream_port, req.path, cache_port);
                 // Close stream automatically.
                 completion_chan.send(true);
+		debug!("=====Terminated connection from [{:s}].=====", req.peer_name);
+
             });
         }
     }
